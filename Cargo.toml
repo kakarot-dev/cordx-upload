@@ -1,6 +1,6 @@
 [package]
 name = "cordx-upload"
-version = "0.1.0"
+version = "1.0.0"
 edition = "2021"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
@@ -12,7 +12,7 @@ paris = { version = "1.5.15", features = ["macros", "timestamps"] }
 ureq = { version = "2.9.4", features = ["json"] }
 ureq_multipart = "1.1.1"
 serde = { version = "1.0.196", features = ["derive"] }
-arboard = "3.3.0"
+arboard = { version = "3.3.0", features = ["wl-clipboard-rs"]}
 lazy_static = "1.4.0"
 notify-rust = "4.10.0"
 clap = { version = "4.5.0", features = ["derive"] }

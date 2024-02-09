@@ -1,22 +1,20 @@
-use std::fs::File;
-use std::io::Read;
+use arboard::Clipboard;
+use clap::Parser;
 use futures::{
     channel::mpsc::{channel, Receiver},
     SinkExt, StreamExt,
 };
-use notify::{Config, Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
-use std::path::Path;
-use std::sync::Mutex;
-use notify::event::{AccessKind, AccessMode};
-use paris::{error, info};
-use ureq_multipart::MultipartBuilder;
-use serde::Deserialize;
-use arboard::Clipboard;
 use lazy_static::lazy_static;
+use notify::event::{AccessKind, AccessMode};
+use notify::{Config, Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use notify_rust::Notification;
-use std::collections::HashMap;
-use clap::Parser;
-
+use paris::{error, info};
+use serde::Deserialize;
+use std::{fs::File, io::Read};
+use std::path::Path;
+use std::str::FromStr;
+use std::sync::RwLock;
+use ureq_multipart::MultipartBuilder;
 /// Simple program to greet a person
 #[derive(Parser, Debug)]
 #[command(version, about, long_about = None)]
@@ -35,31 +33,25 @@ struct Args {
 
     // Secret
     #[arg(short, long)]
-    secret: String
+    secret: String,
 }
 
-pub struct KeyValueStore {
-    store: HashMap<String, String>,
+#[derive(Debug, Clone)]
+pub struct AppConfig {
+    pub domain: String,
+    pub path: String,
+    pub userid: String,
+    pub secret: String,
 }
 
-impl KeyValueStore {
-    pub fn new() -> Self {
-        KeyValueStore {
-            store: HashMap::new(),
-        }
-    }
-
-    pub fn set(&mut self, key: &str, value: &str) {
-        self.store.insert(key.to_string(), value.to_string());
-    }
-
-    pub fn get(&self, key: &str) -> Option<&String> {
-        self.store.get(key)
-    }
-}
 lazy_static! {
-    pub static ref CLIPBOARD: Mutex<Clipboard> = Mutex::new(Clipboard::new().unwrap());
-    pub static ref CONFIG: Mutex<KeyValueStore> = Mutex::new(KeyValueStore::new());
+    pub static ref CLIPBOARD: RwLock<Clipboard> = RwLock::new(Clipboard::new().expect("Couldnt access clipboard"));
+    pub static ref CONFIG: RwLock<AppConfig> = RwLock::new(AppConfig {
+        domain: String::from_str("https://cordx.lol").expect("Couldnt unwrap domain"),
+        path: String::from_str("/home/usr/Documents/ScreenShots").expect("Couldnt unwrap path"),
+        userid: String::from_str("1234567890").expect("Couldnt unwrap userId"),
+        secret: String::from_str("ceowhur").expect("Couldnt unwrap secret")
+    });
 }
 #[derive(Deserialize)]
 struct ResponseUpload {
@@ -71,14 +63,20 @@ const MAX_FILE_SIZE_BYTES: usize = 500 * 1024 * 1024;
 fn main() {
     let args = Args::parse();
 
-    let mut kv = CONFIG.lock().unwrap();
-
-    kv.set("domain", &args.domain);
-    kv.set("path", &args.path);
-    kv.set("uid", &args.uid);
-    kv.set("secret", &args.secret);
-
-    let path = kv.get("path").unwrap();
+    // Use match for better error handling
+    match CONFIG.write() {
+        Ok(mut kv) => {
+            kv.domain = args.domain;
+            kv.userid = args.uid;
+            kv.path = args.path.clone(); // clone here if kv.path needs to own the value
+            kv.secret = args.secret;
+        },
+        Err(e) => {
+            eprintln!("Failed to acquire write lock: {}", e);
+            return; // or handle error as appropriate
+        }
+    }
+    let path = args.path;
     info!("Watching {}", path);
 
     futures::executor::block_on(async {
@@ -121,11 +119,10 @@ async fn async_watch<P: AsRef<Path>>(path: P) -> notify::Result<()> {
     Ok(())
 }
 
-
 async fn handle_event(event: Event) -> () {
     match event.kind {
         EventKind::Access(AccessKind::Close(AccessMode::Write)) => {
-            let mut clipboard = CLIPBOARD.lock().unwrap();
+            let mut clipboard = CLIPBOARD.write().unwrap();
             for x in event.paths {
                 let file_name = Path::new(&x)
                     .file_name()
@@ -141,27 +138,30 @@ async fn handle_event(event: Event) -> () {
                 };
 
                 let mut file_content = Vec::new();
-                file.read_to_end(&mut file_content).expect("Error Occurred while opening file");
+                file.read_to_end(&mut file_content)
+                    .expect("Error Occurred while opening file");
 
                 if file_content.len() > MAX_FILE_SIZE_BYTES {
-                    error!("File {:?} too big to be uploaded to CordX", file_name)
+                    error!("File {:?} too big to be uploaded to CordX", file_name);
+                    return;
                 }
-                let (content_type,data) = MultipartBuilder::new()
+                let (content_type, data) = MultipartBuilder::new()
                     .add_file("sharex", x.clone())
-                    .unwrap().finish().unwrap();
-                let config = CONFIG.lock().unwrap();
-                let domain = config.get("domain").unwrap();
-                let uid = config.get("uid").unwrap();
-                let secret = config.get("secret").unwrap();
-                let response =
-                    ureq::post(format!("{}/api/upload/sharex", domain).as_str())
-                    .set("userid", uid)
-                    .set("secret", secret)
+                    .unwrap()
+                    .finish()
+                    .unwrap();
+
+                let config_lock = CONFIG.read().unwrap();
+                let config = config_lock.clone();
+                let domain = config.domain;
+                let uid = config.userid;
+                let secret = config.secret;
+                let response = ureq::post(format!("{}/api/upload/sharex", domain).as_str())
+                    .set("userid", uid.as_str())
+                    .set("secret", secret.as_str())
                     .set("Content-Type", &content_type)
                     .send_bytes(&data)
-                        .map_err(|e| {
-                            error!("Error while uploading files to CordX: {:?}", e)
-                        });
+                    .map_err(|e| error!("Error while uploading files to CordX: {:?}", e));
                 match response {
                     Ok(response) => {
                         if response.status() == 200 {
@@ -170,7 +170,8 @@ async fn handle_event(event: Event) -> () {
                             Notification::new()
                                 .summary("CordX Upload")
                                 .body("Picture Uploaded! URL Copied to Clipboard")
-                                .show().expect("Panic: Notification Error");
+                                .show()
+                                .expect("Panic: Notification Error");
                             info!("Successfully uploaded files: {:?}", data.url)
                         } else {
                             error!("Request failed with status code: {}", response.status());
@@ -182,10 +183,10 @@ async fn handle_event(event: Event) -> () {
                     }
                 }
             }
-            },
+        }
         default => {
             info!("Change Occurred: {:?}", default)
         }
     }
-    return ()
+    return ();
 }
